@@ -12,6 +12,7 @@ const char* LOCAL_HOSTNAME = "poollight.local";
 const int relayPin = 4;
 const int buttonPin = 5;
 const int ledPin = 13;
+const bool relayActiveLow = true; // Relay is active-low: LOW = ON, HIGH = OFF
 
 Preferences prefs;
 WiFiServer server(80);
@@ -35,10 +36,18 @@ enum DeviceMode {
 
 DeviceMode deviceMode = MODE_SETUP;
 
+void setRelayState(bool on) {
+  int level = on ? (relayActiveLow ? LOW : HIGH) : (relayActiveLow ? HIGH : LOW);
+  digitalWrite(relayPin, level);
+}
+
+bool isRelayOn() {
+  return digitalRead(relayPin) == (relayActiveLow ? LOW : HIGH);
+}
+
 void setup() {
   pinMode(relayPin, OUTPUT);
-  // Relay is active-high: LOW = off, HIGH = on
-  digitalWrite(relayPin, LOW);
+  setRelayState(false);
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
@@ -85,7 +94,7 @@ void startSetupMode() {
   WiFi.softAP(AP_SSID);
   delay(100);
   // Ensure relay is off while in setup mode to avoid accidental toggles
-  digitalWrite(relayPin, LOW);
+  setRelayState(false);
   IPAddress ip = WiFi.softAPIP();
   Serial.printf("Setup page available at http://%u.%u.%u.%u/\n", ip[0], ip[1], ip[2], ip[3]);
   server.begin();
@@ -217,10 +226,10 @@ void handleStaClients() {
     }
     Serial.printf("Power request received: '%s' (path='%s')\n", value.c_str(), path.c_str());
     if (value.equalsIgnoreCase("on")) {
-      digitalWrite(relayPin, HIGH);
+      setRelayState(true);
       sendHttpResponse(client, 200, "text/plain", "Power ON");
     } else {
-      digitalWrite(relayPin, LOW);
+      setRelayState(false);
       sendHttpResponse(client, 200, "text/plain", "Power OFF");
     }
   } else if (request.startsWith("GET /lock")) {
@@ -426,7 +435,7 @@ String buildStaPage() {
   html += "</head><body><h1>Light Control</h1>";
   html += "<p>Device IP: " + deviceIp + "</p>";
   // Power control (slider)
-  bool powerOn = digitalRead(relayPin) == HIGH;
+  bool powerOn = isRelayOn();
   html += "<div style=\"display:flex;align-items:center;gap:12px;\">";
   html += "<label for=\"power\">Power</label>";
   html += "<label class=\"switch\"><input id=\"power\" type=\"checkbox\" " + String(powerOn ? "checked" : "") + " /><span class=\"sliderToggle\"></span></label>";
@@ -637,12 +646,12 @@ void applyColor(const String& color) {
 
 void toggleRelay(int count) {
   // Pulse the relay 'count' times while preserving its original steady state
-  int orig = digitalRead(relayPin);
-  int pulse = (orig == HIGH) ? LOW : HIGH;
+  bool orig = isRelayOn();
+  bool pulse = !orig;
   for (int i = 0; i < count; i++) {
-    digitalWrite(relayPin, pulse);
+    setRelayState(pulse);
     delay(pulseDelayMs);
-    digitalWrite(relayPin, orig);
+    setRelayState(orig);
     delay(pulseDelayMs);
   }
 }

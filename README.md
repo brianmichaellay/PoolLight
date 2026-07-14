@@ -8,7 +8,7 @@ Features:
 - Broadcasts `LIGHT_SETUP` SSID in reset/setup mode
 - Accepts Wi-Fi SSID/password from the app via HTTP POST to `/config`
 - Stores credentials in flash using `Preferences`
- - Reboots and retries indefinitely every 20 seconds until connected
+- Reboots and retries indefinitely every 20 seconds until connected
 - Serves a simple HTTP endpoint `/color` to receive a color command
 - Controls relay on pin `4` by toggling it a set number of times per color
 - Uses pin `5` for button input and pin `6` for LED output
