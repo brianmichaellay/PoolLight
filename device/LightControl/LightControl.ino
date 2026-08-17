@@ -10,13 +10,15 @@ const char* HOSTNAME = "poollight";
 const char* LOCAL_HOSTNAME = "poollight.local";
 
 const int relayPin = 4;
-const int buttonPin = 5;
-const int ledPin = 13;
-const bool relayActiveLow = true; // Relay is active-low: LOW = ON, HIGH = OFF
+const int buttonPin = 13;
+const int ledPin = 5;
+const int relayOnLevel = HIGH;
+const int relayOffLevel = LOW;
 
 Preferences prefs;
 WiFiServer server(80);
 
+bool relayState = false;
 bool hasConfig = false;
 String savedSSID;
 String savedPassword;
@@ -37,12 +39,12 @@ enum DeviceMode {
 DeviceMode deviceMode = MODE_SETUP;
 
 void setRelayState(bool on) {
-  int level = on ? (relayActiveLow ? LOW : HIGH) : (relayActiveLow ? HIGH : LOW);
-  digitalWrite(relayPin, level);
+  relayState = on;
+  digitalWrite(relayPin, on ? relayOnLevel : relayOffLevel);
 }
 
 bool isRelayOn() {
-  return digitalRead(relayPin) == (relayActiveLow ? LOW : HIGH);
+  return relayState;
 }
 
 void setup() {
@@ -52,8 +54,13 @@ void setup() {
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
 
-  Serial.begin(115200);
-  delay(100);
+  Serial.begin(115200); 
+  delay(1000);
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("Light Control booting...");
+  Serial.println("================================");
+  Serial.flush();
 
   prefs.begin("light", false);
   hasConfig = prefs.getBool("configured", false);
@@ -102,6 +109,15 @@ void startSetupMode() {
   wifiAttempts = 0;
 }
 
+void printWiFiConnectionInfo() {
+  IPAddress ip = WiFi.localIP();
+  Serial.print("Wi-Fi connected. IP address: ");
+  Serial.println(ip);
+  Serial.print("Open http://");
+  Serial.print(ip);
+  Serial.println("/");
+}
+
 void startStaMode() {
   Serial.println("Starting STA mode");
   WiFi.softAPdisconnect(true);
@@ -111,6 +127,7 @@ void startStaMode() {
   // If already connected, ensure the Wi-Fi LED shows solid
   if (WiFi.status() == WL_CONNECTED) {
     digitalWrite(ledPin, HIGH);
+    printWiFiConnectionInfo();
   } else {
     digitalWrite(ledPin, LOW);
   }
@@ -129,6 +146,7 @@ void attemptWiFiConnect() {
     return;
   }
 
+  WiFi.setHostname(HOSTNAME);
   Serial.printf("Connecting to SSID '%s' attempt %d\n", savedSSID.c_str(), wifiAttempts + 1);
   WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
 
@@ -136,12 +154,10 @@ void attemptWiFiConnect() {
   while (millis() - start < 5000) {
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("Connected to Wi-Fi");
-      IPAddress ip = WiFi.localIP();
-      Serial.printf("Device IP address: http://%u.%u.%u.%u/\n", ip[0], ip[1], ip[2], ip[3]);
+      printWiFiConnectionInfo();
       // Show solid Wi-Fi LED when connected
       digitalWrite(ledPin, HIGH);
-      WiFi.setHostname(HOSTNAME);
-      Serial.printf("Set Wi-Fi hostname to %s for router registration\n", HOSTNAME);
+      Serial.printf("Wi-Fi hostname set to %s for router registration\n", HOSTNAME);
       if (MDNS.begin(HOSTNAME)) {
         Serial.printf("mDNS responder started for %s\n", LOCAL_HOSTNAME);
       } else {
@@ -203,6 +219,11 @@ void handleStaClients() {
 
   Serial.println("Client connected to STA server");
   String request = readHttpRequest(client);
+  if (request.length() == 0) {
+    Serial.println("Empty request received, ignoring");
+    client.stop();
+    return;
+  }
   Serial.println(request);
 
   if (request.startsWith("GET /color/")) {
@@ -276,7 +297,7 @@ void handleStaClients() {
 
 String readHttpRequest(WiFiClient& client) {
   String request = "";
-  unsigned long timeout = millis() + 2000;
+  unsigned long timeout = millis() + 4000;
   while (client.connected() && millis() < timeout) {
     if (client.available()) {
       String line = client.readStringUntil('\n');
@@ -284,6 +305,8 @@ String readHttpRequest(WiFiClient& client) {
       if (line == "\r") {
         break;
       }
+    } else {
+      delay(10);
     }
   }
 
@@ -391,6 +414,9 @@ String buildSetupPage() {
   String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Light Setup</title>";
   html += "<style>body{font-family:Arial,sans-serif;padding:20px;font-size:18px;}label{display:block;margin-top:12px;}";
   html += "select,input{width:30ch;max-width:100%;padding:8px;margin-top:4px;display:inline-block;font-size:16px;}button{margin-top:16px;padding:10px 18px;}";
+  html += ".passwordRow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;max-width:32ch;}";
+  html += ".passwordRow input{flex:1 1 18ch;min-width:18ch;width:18ch;}";
+  html += ".passwordRow button{margin:0;padding:6px 10px;}";
   html += "</style></head><body><h1>Light Setup</h1><p>Select your Wi-Fi network and enter the password.</p>";
   html += "<form method=\"POST\" action=\"/config\">";
   html += "<label for=\"ssid\">Wi-Fi SSID</label><select id=\"ssid\" name=\"ssid\">";
@@ -407,8 +433,9 @@ String buildSetupPage() {
   }
 
   html += "</select>";
-  html += "<label for=\"pass\">Password</label><input id=\"pass\" name=\"pass\" type=\"password\" autocomplete=\"new-password\" placeholder=\"Wi-Fi password\">";
+  html += "<label for=\"pass\">Password</label><div class=\"passwordRow\"><input id=\"pass\" name=\"pass\" type=\"password\" autocomplete=\"new-password\" placeholder=\"Wi-Fi password\"><button type=\"button\" id=\"togglePass\">Show</button></div>";
   html += "<button type=\"submit\">Save Wi-Fi</button></form>";
+  html += "<script>const passInput=document.getElementById('pass');const togglePass=document.getElementById('togglePass');if(passInput&&togglePass){togglePass.addEventListener('click',()=>{const show=passInput.type==='password';passInput.type=show?'text':'password';togglePass.textContent=show?'Hide':'Show';});}</script>";
   html += "<p>If your network does not appear, refresh the page.</p></body></html>";
   return html;
 }
@@ -502,6 +529,7 @@ String buildStaPage() {
   html += "  getColorInputs().forEach(i=>i.disabled=disabled);";
   html += "  colorBtn.disabled = disabled;";
   html += "  colorLockBtn.disabled = disabled || !isLockableColor();";
+  html += "  returnBtn.disabled = disabled;";
   html += "  if (!disabled) statusText.textContent = '';";
   html += "}";
   html += "function isLockableColor(){";
@@ -645,15 +673,20 @@ void applyColor(const String& color) {
 }
 
 void toggleRelay(int count) {
-  // Pulse the relay 'count' times while preserving its original steady state
-  bool orig = isRelayOn();
-  bool pulse = !orig;
+  // Pulse the relay count times as LOW -> HIGH pairs while preserving the
+  // current power state after the sequence finishes.
+  if (count < 1) {
+    return;
+  }
+
+  bool steadyState = isRelayOn();
   for (int i = 0; i < count; i++) {
-    setRelayState(pulse);
+    setRelayState(false);
     delay(pulseDelayMs);
-    setRelayState(orig);
+    setRelayState(true);
     delay(pulseDelayMs);
   }
+  setRelayState(steadyState);
 }
 
 void handleButton() {
