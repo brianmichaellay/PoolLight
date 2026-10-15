@@ -14,12 +14,14 @@ const int buttonPin = 13;
 const int ledPin = 5;
 const int relayOnLevel = HIGH;
 const int relayOffLevel = LOW;
+const int WIFI_LOG_LIMIT = 20;
 
 Preferences prefs;
 WiFiServer server(80);
 
 bool relayState = false;
 bool hasConfig = false;
+bool wifiWasConnected = false;
 String savedSSID;
 String savedPassword;
 int wifiAttempts = 0;
@@ -47,6 +49,60 @@ bool isRelayOn() {
   return relayState;
 }
 
+String trimWiFiLog(String log) {
+  int totalEntries = 1;
+  for (int i = 0; i < log.length(); i++) {
+    if (log[i] == '\n') {
+      totalEntries++;
+    }
+  }
+
+  if (totalEntries <= WIFI_LOG_LIMIT) {
+    return log;
+  }
+
+  int skipEntries = totalEntries - WIFI_LOG_LIMIT;
+  int lineIndex = 0;
+  int startPos = 0;
+  for (int i = 0; i < log.length(); i++) {
+    if (log[i] == '\n') {
+      lineIndex++;
+      if (lineIndex == skipEntries) {
+        startPos = i + 1;
+        break;
+      }
+    }
+  }
+
+  if (startPos > 0 && startPos < log.length()) {
+    return log.substring(startPos);
+  }
+
+  return log;
+}
+
+void logEvent(const String& message) {
+  String entry = String(millis()) + "ms " + message;
+  String log = prefs.getString("wifi_log", "");
+  if (log.length() > 0) {
+    log += "\n";
+  }
+  log += entry;
+  prefs.putString("wifi_log", trimWiFiLog(log));
+}
+
+String readWiFiLog() {
+  String log = prefs.getString("wifi_log", "No Wi-Fi events logged yet.");
+  if (log.length() == 0) {
+    return "No Wi-Fi events logged yet.";
+  }
+  return log;
+}
+
+void clearWiFiLog() {
+  prefs.putString("wifi_log", "");
+}
+
 void setup() {
   pinMode(relayPin, OUTPUT);
   setRelayState(false);
@@ -63,6 +119,7 @@ void setup() {
   Serial.flush();
 
   prefs.begin("light", false);
+  logEvent("boot");
   hasConfig = prefs.getBool("configured", false);
   pulseDelayMs = prefs.getInt("pulseDelay", 250);
   if (hasConfig) {
@@ -80,6 +137,12 @@ void setup() {
 void loop() {
   handleButton();
 
+  bool currentWiFiConnected = (WiFi.status() == WL_CONNECTED);
+  if (!currentWiFiConnected && wifiWasConnected) {
+    logEvent("WiFi lost");
+  }
+  wifiWasConnected = currentWiFiConnected;
+
   if (deviceMode == MODE_SETUP) {
     handleSetupClients();
     updateLedFlash();
@@ -95,6 +158,7 @@ void loop() {
 
 void startSetupMode() {
   Serial.println("Starting setup mode: broadcasting LIGHT_SETUP");
+  logEvent("setup mode started");
   WiFi.disconnect(true, true);
   delay(100);
   WiFi.mode(WIFI_AP_STA);
@@ -104,30 +168,47 @@ void startSetupMode() {
   setRelayState(false);
   IPAddress ip = WiFi.softAPIP();
   Serial.printf("Setup page available at http://%u.%u.%u.%u/\n", ip[0], ip[1], ip[2], ip[3]);
+  logEvent("setup AP available");
   server.begin();
   deviceMode = MODE_SETUP;
   wifiAttempts = 0;
 }
 
-void printWiFiConnectionInfo() {
+void printWiFiConnectionInfo(int attemptCount = 1) {
   IPAddress ip = WiFi.localIP();
   Serial.print("Wi-Fi connected. IP address: ");
   Serial.println(ip);
   Serial.print("Open http://");
   Serial.print(ip);
   Serial.println("/");
+  logEvent("WiFi connected IP=" + ip.toString() + " after " + String(attemptCount) + " attempt(s)");
+}
+
+void restartMdns() {
+  MDNS.end();
+  delay(100);
+  if (MDNS.begin(HOSTNAME)) {
+    Serial.printf("mDNS responder restarted for %s\n", LOCAL_HOSTNAME);
+    logEvent("mDNS restarted for poollight.local");
+  } else {
+    Serial.println("mDNS responder failed to restart");
+    logEvent("mDNS restart failed");
+  }
 }
 
 void startStaMode() {
   Serial.println("Starting STA mode");
+  logEvent("STA mode started");
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   Serial.printf("Set Wi-Fi hostname to %s for router registration\n", HOSTNAME);
+  logEvent("hostname set to poollight");
   // If already connected, ensure the Wi-Fi LED shows solid
   if (WiFi.status() == WL_CONNECTED) {
     digitalWrite(ledPin, HIGH);
     printWiFiConnectionInfo();
+    restartMdns();
   } else {
     digitalWrite(ledPin, LOW);
   }
@@ -147,22 +228,22 @@ void attemptWiFiConnect() {
   }
 
   WiFi.setHostname(HOSTNAME);
-  Serial.printf("Connecting to SSID '%s' attempt %d\n", savedSSID.c_str(), wifiAttempts + 1);
+  Serial.printf("Connecting to SSID '%s'\n", savedSSID.c_str());
+  if (wifiAttempts == 0) {
+    logEvent("WiFi reconnecting");
+  }
   WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
 
   unsigned long start = millis();
   while (millis() - start < 5000) {
     if (WiFi.status() == WL_CONNECTED) {
+      int totalAttempts = wifiAttempts + 1;
       Serial.println("Connected to Wi-Fi");
-      printWiFiConnectionInfo();
+      printWiFiConnectionInfo(totalAttempts);
       // Show solid Wi-Fi LED when connected
       digitalWrite(ledPin, HIGH);
       Serial.printf("Wi-Fi hostname set to %s for router registration\n", HOSTNAME);
-      if (MDNS.begin(HOSTNAME)) {
-        Serial.printf("mDNS responder started for %s\n", LOCAL_HOSTNAME);
-      } else {
-        Serial.println("mDNS responder failed to start");
-      }
+      restartMdns();
       server.begin();
       wifiAttempts = 0;
       nextWiFiAttempt = 0;
@@ -171,9 +252,9 @@ void attemptWiFiConnect() {
     delay(100);
   }
 
-  // Failed this attempt: increment counter for logging and schedule next attempt
+  // Failed this attempt: keep the log quiet and schedule the next retry.
   wifiAttempts++;
-  Serial.printf("Connect failed, count=%d — will retry in 20s\n", wifiAttempts);
+  Serial.printf("Connect failed, will retry in 20s\n");
   nextWiFiAttempt = millis() + 20000UL; // schedule next try in 20 seconds (non-blocking)
 }
 
@@ -194,6 +275,7 @@ void handleSetupClients() {
 
     if (ssid.length() > 0) {
       saveConfig(ssid, pass);
+      logEvent("configuration saved");
       sendHttpResponse(client, 200, "text/plain", "Configuration saved. Rebooting...");
       delay(1000);
       ESP.restart();
@@ -201,6 +283,12 @@ void handleSetupClients() {
     }
 
     sendHttpResponse(client, 400, "text/plain", "Missing ssid or pass");
+  } else if (request.startsWith("GET /log")) {
+    sendHttpResponse(client, 200, "text/plain", readWiFiLog());
+  } else if (request.startsWith("GET /clear-log")) {
+    clearWiFiLog();
+    logEvent("log cleared by user");
+    sendHttpResponse(client, 200, "text/plain", "Wi-Fi log cleared");
   } else if (request.startsWith("GET /identity")) {
     sendHttpResponse(client, 200, "text/plain", "poollight-setup");
   } else if (request.startsWith("GET /")) {
@@ -226,7 +314,13 @@ void handleStaClients() {
   }
   Serial.println(request);
 
-  if (request.startsWith("GET /color/")) {
+  if (request.startsWith("GET /log")) {
+    sendHttpResponse(client, 200, "text/plain", readWiFiLog());
+  } else if (request.startsWith("GET /clear-log")) {
+    clearWiFiLog();
+    logEvent("log cleared by user");
+    sendHttpResponse(client, 200, "text/plain", "Wi-Fi log cleared");
+  } else if (request.startsWith("GET /color/")) {
     String path = getRequestPath(request);
     String value = "";
     if (path.startsWith("/color/")) {
@@ -498,6 +592,10 @@ String buildStaPage() {
   html += "<input id=\"pulseDelay\" type=\"number\" min=\"1\" value=\"" + String(pulseDelayMs) + "\" style=\"width:8ch;padding:4px;\">";
   html += "<button id=\"pulseDelayBtn\" type=\"button\">Save delay</button>";
   html += "</div>";
+  html += "<div style=\"display:flex;align-items:center;gap:8px;flex-wrap:wrap;\">";
+  html += "<button id=\"viewLogBtn\" type=\"button\">View Log</button>";
+  html += "<button id=\"clearLogBtn\" type=\"button\">Clear Log</button>";
+  html += "</div>";
   html += "<div id=\"advancedStatusText\" style=\"font-size:0.95em;color:#333;\"></div>";
   html += "<form method=\"POST\" action=\"/reset\" style=\"margin:0;\">";
   html += "<button type=\"submit\">Reset Wi-Fi Configuration</button>";
@@ -517,6 +615,8 @@ String buildStaPage() {
   html += "const statusText = document.getElementById('statusText');";
   html += "const pulseDelayInput = document.getElementById('pulseDelay');";
   html += "const pulseDelayBtn = document.getElementById('pulseDelayBtn');";
+  html += "const viewLogBtn = document.getElementById('viewLogBtn');";
+  html += "const clearLogBtn = document.getElementById('clearLogBtn');";
   html += "const advancedStatusText = document.getElementById('advancedStatusText');";
   html += "let powerRequestInFlight = false;";
   html += "function getColorInputs(){ return Array.from(colorField.querySelectorAll(\"input[name=\\\"color\\\"]\")); }";
@@ -635,6 +735,24 @@ String buildStaPage() {
   html += "    advancedStatusText.textContent = 'Failed to save pulse delay';";
   html += "  } finally {";
   html += "    pulseDelayBtn.disabled = false;";
+  html += "  }";
+  html += "});";
+  html += "viewLogBtn.addEventListener('click', ()=>{";
+  html += "  const win = window.open('/log', '_blank', 'noopener');";
+  html += "  if (!win) { advancedStatusText.textContent = 'Allow pop-ups to view the log'; } else { advancedStatusText.textContent = 'Log opened in a new tab.'; }";
+  html += "});";
+  html += "clearLogBtn.addEventListener('click', async ()=>{";
+  html += "  clearLogBtn.disabled = true;";
+  html += "  advancedStatusText.textContent = 'Clearing Wi-Fi log...';";
+  html += "  try {";
+  html += "    const resp = await fetch('/clear-log', {method:'GET', cache:'no-store'});";
+  html += "    if (!resp.ok) throw new Error('HTTP ' + resp.status);";
+  html += "    await resp.text();";
+  html += "    advancedStatusText.textContent = 'Wi-Fi log cleared.';";
+  html += "  } catch (err) {";
+  html += "    advancedStatusText.textContent = 'Failed to clear Wi-Fi log';";
+  html += "  } finally {";
+  html += "    clearLogBtn.disabled = false;";
   html += "  }";
   html += "});";
   html += "</script>";
