@@ -455,7 +455,7 @@ struct ContentView: View {
     ]
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
                 if deviceAddress == nil {
                     if showSetupForm {
