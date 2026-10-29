@@ -320,7 +320,8 @@ enum ColorSwatchImages {
 
     static func image(for colorID: String) -> UIImage {
         if let cached = cache[colorID] { return cached }
-        let renderer = ImageRenderer(content: ColorSwatchView(colorID: colorID))
+        // Transparent trailing padding adds space between the swatch and its name, since menus don't allow setting label spacing
+        let renderer = ImageRenderer(content: ColorSwatchView(colorID: colorID).padding(.trailing, 10))
         renderer.scale = 3
         // Original rendering keeps the colors; menus would otherwise tint the image
         let image = (renderer.uiImage ?? UIImage()).withRenderingMode(.alwaysOriginal)
@@ -539,15 +540,6 @@ struct ContentView: View {
 
                 if deviceAddress != nil {
                     Section {
-                        if isBusy {
-                            HStack(spacing: 12) {
-                                OperationProgressRing(start: operationStart, duration: operationDuration)
-                                    .frame(width: 28, height: 28)
-                                Text(operationName)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-
                         Toggle("Light On", isOn: $lightOn)
                             .disabled(isBusy)
                             .onGeometryChange(for: CGRect.self) { proxy in
@@ -573,10 +565,7 @@ struct ContentView: View {
                                 .tag(value)
                             }
                         } label: {
-                            HStack(spacing: 10) {
-                                Text("Color")
-                                ColorSwatchView(colorID: selectedColor)
-                            }
+                            Text("Color")
                         }
                         .pickerStyle(MenuPickerStyle())
                         .disabled(!lightOn || isBusy)
@@ -724,6 +713,21 @@ struct ContentView: View {
                 }
                 .ignoresSafeArea()
             )
+            // Progress floats over the screen so it doesn't push the layout down
+            .overlay {
+                if isBusy {
+                    VStack(spacing: 14) {
+                        OperationProgressRing(start: operationStart, duration: operationDuration)
+                            .frame(width: 56, height: 56)
+                        Text(operationName)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(28)
+                    .background(.ultraThinMaterial.opacity(0.85), in: RoundedRectangle(cornerRadius: 20))
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: isBusy)
             .preferredColorScheme(.dark)
             .navigationTitle("Pool Light Control")
             .toolbar {

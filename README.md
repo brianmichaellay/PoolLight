@@ -1,6 +1,6 @@
-# ESP32 Light Control Skeleton
+# Pool Light Control
 
-This workspace contains a basic ESP32 S3 program skeleton and an Apple device app skeleton for pool light control.
+Controls a J&J ColorSplash XG pool light with an ESP32-S3 relay controller and an iOS app.
 
 ## Device Side (`device/LightControl.ino`)
 
@@ -15,12 +15,18 @@ Features:
 - Flashes LED during setup mode, stays solid when connected
 - Long button press (10 seconds) resets configuration and returns to setup mode
 
-## App Side (`ios/LightControlApp.swift`)
+## App Side (`ios/`)
+
+An iOS/iPadOS SwiftUI app, "J&J ColorSplash XG Light Control". Open `ios/PoolLight.xcodeproj` in Xcode; the app's code is in `ios/PoolLight/LightControlApp.swift`. Requires iOS 17.6 or later.
 
 Features:
-- SwiftUI skeleton with fields to send SSID/password
-- Sends HTTP POST requests to the ESP32 setup endpoint
-- Sends color commands to the ESP32 device
+- Finds the controller automatically: last known address, Bonjour, `poollight.local`, then a scan of the local subnet
+- Wi-Fi setup over the `LIGHT_SETUP` network: the controller scans for networks and the app sends the chosen SSID/password
+- Turns the light on/off and picks any of its 12 colors/shows, with a swatch for each
+- Color Lock and Return commands, plus an adjustable pulse delay
+- Reads the controller's current state so the app matches the light
+- Shows a progress ring while a pulse sequence runs and locks the controls until it finishes
+- View or clear the controller's log, and reset its network settings
 
 ## Notes
 
