@@ -15,6 +15,8 @@ const int ledPin = 5;
 const int relayOnLevel = HIGH;
 const int relayOffLevel = LOW;
 const int WIFI_LOG_LIMIT = 20;
+// If newly entered Wi-Fi settings never connect (e.g. wrong password), return to setup mode after this long
+const unsigned long UNVERIFIED_WIFI_TIMEOUT_MS = 120000UL;
 
 Preferences prefs;
 WiFiServer server(80);
@@ -26,6 +28,9 @@ String savedSSID;
 String savedPassword;
 int wifiAttempts = 0;
 unsigned long nextWiFiAttempt = 0;
+// False until the saved Wi-Fi settings have connected at least once
+bool wifiVerified = true;
+unsigned long staModeStarted = 0;
 
 int pulseDelayMs = 250;
 
@@ -121,6 +126,8 @@ void setup() {
   prefs.begin("light", false);
   logEvent("boot");
   hasConfig = prefs.getBool("configured", false);
+  // Missing key means settings saved before this check existed; treat them as working
+  wifiVerified = prefs.getBool("wifiVerified", true);
   pulseDelayMs = prefs.getInt("pulseDelay", 250);
   if (hasConfig) {
     savedSSID = prefs.getString("ssid", "");
@@ -148,6 +155,12 @@ void loop() {
     updateLedFlash();
   } else if (deviceMode == MODE_STA) {
     if (WiFi.status() != WL_CONNECTED) {
+      // Settings that have worked before keep retrying (e.g. router outage); new ones that
+      // never connected are probably wrong, so go back to setup mode
+      if (!wifiVerified && millis() - staModeStarted >= UNVERIFIED_WIFI_TIMEOUT_MS) {
+        returnToSetupAfterFailedJoin();
+        return;
+      }
       attemptWiFiConnect();
     } else {
       digitalWrite(ledPin, HIGH);
@@ -215,6 +228,7 @@ void startStaMode() {
   // Ensure the HTTP server is listening as soon as we enter STA mode
   server.begin();
   deviceMode = MODE_STA;
+  staModeStarted = millis();
 }
 
 void attemptWiFiConnect() {
@@ -247,6 +261,11 @@ void attemptWiFiConnect() {
       server.begin();
       wifiAttempts = 0;
       nextWiFiAttempt = 0;
+      if (!wifiVerified) {
+        wifiVerified = true;
+        prefs.putBool("wifiVerified", true);
+        logEvent("new Wi-Fi settings verified");
+      }
       return;
     }
     delay(100);
@@ -765,6 +784,7 @@ void saveConfig(const String& ssid, const String& pass) {
   prefs.putString("ssid", ssid);
   prefs.putString("pass", pass);
   prefs.putBool("configured", true);
+  prefs.putBool("wifiVerified", false);
   savedSSID = ssid;
   savedPassword = pass;
 }
@@ -826,6 +846,21 @@ void resetToSetupMode() {
   hasConfig = false;
   savedSSID = "";
   savedPassword = "";
+  startSetupMode();
+}
+
+// Forgets only the Wi-Fi settings (keeping the log and pulse delay) and starts setup mode.
+void returnToSetupAfterFailedJoin() {
+  Serial.println("New Wi-Fi settings never connected: returning to setup mode");
+  prefs.remove("ssid");
+  prefs.remove("pass");
+  prefs.remove("configured");
+  prefs.remove("wifiVerified");
+  hasConfig = false;
+  savedSSID = "";
+  savedPassword = "";
+  wifiVerified = true;
+  logEvent("couldn't join Wi-Fi with new settings; returning to setup mode");
   startSetupMode();
 }
 

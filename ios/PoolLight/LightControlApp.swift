@@ -389,11 +389,11 @@ struct OperationProgressRing: View {
 
 @MainActor
 struct ContentView: View {
-    @Environment(\.openURL) private var openURL
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("lastDeviceAddress") private var lastDeviceAddress = ""
     /// Picker tag for the "Enter manually…" option
     static let manualNetworkTag = "__manual__"
+    static let defaultSetupNote = "Choose your home Wi-Fi network and enter its password. The light controller will restart and join it."
     @State private var ssid = ""
     @State private var password = ""
     @State private var showPassword = false
@@ -413,8 +413,18 @@ struct ContentView: View {
     @State private var selectedColor = "1"
     @State private var lightOn = true
     @State private var pulseDelay = "50"
-    @State private var advancedExpanded = false
-    @State private var statusMessage = "Searching for poollight.local..."
+    /// Pulse delay when its field was focused, so it's only sent if it changed
+    @State private var pulseDelayBeforeEdit = ""
+    @FocusState private var pulseDelayFocused: Bool
+    @State private var navigationPath = NavigationPath()
+    /// Detail shown under the connection row, e.g. the discovery step or how the device was found
+    @State private var statusMessage = "Searching for poollight.local…"
+    /// Note under the Wi-Fi setup section
+    @State private var setupNote = ""
+    @State private var errorTitle = ""
+    @State private var errorMessage: String? = nil
+    /// Briefly shown with a checkmark after a command succeeds
+    @State private var confirmation: String? = nil
     @State private var deviceAddress: String? = nil
     /// Numeric IP of the device for display (deviceAddress may be a hostname like poollight.local)
     @State private var deviceIP: String? = nil
@@ -429,13 +439,17 @@ struct ContentView: View {
     /// Screen position of the Light On switch, so the glow can sit behind it
     @State private var toggleFrame: CGRect = .zero
     @State private var showAbout = false
+    @State private var showResetConfirmation = false
+    @State private var showClearLogConfirmation = false
+    /// Log entries from the device, oldest first; nil until loaded
+    @State private var logEntries: [(time: String, message: String)]? = nil
+    @State private var isLoadingLog = false
     @State private var initialDiscoveryDone = false
     @State private var isDiscovering = false
     @State private var discoveryStage: DiscoveryStage = .idle
     @State private var scanProgress: Double = 0
     @State private var showSetupForm = false
     @State private var showConnectSetup = false
-    @State private var showResetInstruction = false
     // domain the ESP will register (router hostname)
     let deviceHost = "poollight"
     let deviceLocalHost = "poollight.local"
@@ -456,11 +470,42 @@ struct ContentView: View {
     ]
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $navigationPath) {
             Form {
+                Section {
+                    HStack(spacing: 10) {
+                        if isDiscovering {
+                            ProgressView()
+                            Text("Searching…")
+                        } else {
+                            // On LIGHT_SETUP the device is reachable, but only for Wi-Fi setup
+                            let connected = deviceAddress != nil || showSetupForm
+                            Circle()
+                                .fill(connected ? Color.green : Color.orange)
+                                .frame(width: 10, height: 10)
+                            Text(connected ? "Connected" : "Not Connected")
+                        }
+                        Spacer()
+                        if let deviceAddress, !isDiscovering {
+                            Text(deviceIP ?? deviceAddress)
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                        } else if showSetupForm && !isDiscovering {
+                            Text("Setup Only")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    if isDiscovering && discoveryStage == .network {
+                        ProgressView(value: scanProgress)
+                    }
+                } footer: {
+                    Text(statusMessage)
+                }
+                .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
+
                 if deviceAddress == nil {
                     if showSetupForm {
-                        Section(header: Text("Setup Wi-Fi")) {
+                        Section {
                             Picker("Network", selection: $selectedNetwork) {
                                 ForEach(availableNetworks, id: \.ssid) { network in
                                     if let signal = network.signalDescription {
@@ -469,7 +514,7 @@ struct ContentView: View {
                                         Text(network.ssid).tag(network.ssid)
                                     }
                                 }
-                                Text("Enter manually…").tag(Self.manualNetworkTag)
+                                Text("Enter Manually…").tag(Self.manualNetworkTag)
                             }
                             .pickerStyle(.menu)
 
@@ -485,7 +530,7 @@ struct ContentView: View {
                                 if isScanningNetworks {
                                     HStack(spacing: 8) {
                                         ProgressView()
-                                        Text("Scanning for networks...")
+                                        Text("Scanning for networks…")
                                     }
                                 } else {
                                     Label("Scan for Networks", systemImage: "arrow.clockwise")
@@ -513,28 +558,39 @@ struct ContentView: View {
                                 .accessibilityLabel(showPassword ? "Hide password" : "Show password")
                             }
 
-                            Button("Send Setup") {
+                            Button("Connect") {
                                 sendSetupConfig()
                             }
                             .disabled(effectiveSSID.isEmpty)
+                        } header: {
+                            Text("Set Up Wi-Fi")
+                        } footer: {
+                            Text(setupNote)
                         }
                     } else if showConnectSetup {
-                        Section(header: Text("Connect to LIGHT_SETUP")) {
-                            Text("Please connect your device to the Wi-Fi network LIGHT_SETUP, then return to the app.")
+                        // The light on the controller tells which state it's in
+                        Section {
+                            troubleshootingRow(
+                                "Light Flashing",
+                                systemImage: "light.max",
+                                "It's in setup mode.\n1. In Settings, connect to the Wi-Fi network LIGHT_SETUP.\n2. Come back to this app and tap \(Image(systemName: "arrow.clockwise")) in the top-right corner."
+                            )
+                            troubleshootingRow(
+                                "Light Off",
+                                systemImage: "lightbulb.slash",
+                                "It's trying to join your Wi-Fi. If you just set it up and the password was wrong, it will start flashing within 2 minutes. If it stays off, hold its button for 10 seconds until the light flashes. If your router was just restarted, wait a few minutes instead."
+                            )
+                            troubleshootingRow(
+                                "Light Solid",
+                                systemImage: "lightbulb.fill",
+                                "It's connected to your Wi-Fi. Make sure you're on the same Wi-Fi network, then tap \(Image(systemName: "arrow.clockwise"))."
+                            )
+                        } header: {
+                            Text("Check the Light on the Controller")
+                        } footer: {
+                            Text("Still not found? In Settings › Privacy & Security › Local Network, make sure this app is turned on.")
                         }
-                    } else if showResetInstruction {
-                        Section(header: Text("Reset ESP32")) {
-                            Text("If you cannot find the device, hold the ESP32 button for 10 seconds to reset it and try again.")
-                        }
-                    } else if discoveryStage == .network {
-                        Section(header: Text("Scanning Local Network")) {
-                            ProgressView(value: scanProgress)
-                            Text(statusMessage)
-                        }
-                    } else if discoveryStage == .domain {
-                        Section(header: Text("Looking for Pool Light")) {
-                            Text(statusMessage)
-                        }
+                        .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
                     }
                 }
 
@@ -578,119 +634,46 @@ struct ContentView: View {
                             sendColorCommand()
                         }
 
-                        HStack(spacing: 12) {
-                            Button("Color Lock") {
-                                sendLockCommand()
-                            }
-                            .buttonStyle(.bordered)
-                            .frame(maxWidth: .infinity)
-                            .disabled(!lightOn || !isColorLockAvailable || isBusy)
-
-                            Button("Return") {
-                                sendReturnCommand()
-                            }
-                            .buttonStyle(.bordered)
-                            .frame(maxWidth: .infinity)
-                            .disabled(!lightOn || isBusy)
-                        }
-
-                        if lightOn && !isColorLockAvailable {
-                            Text("Color Lock is only active for colors 1–7.")
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
-
-                    Section(header: Text("Advanced")) {
-                        DisclosureGroup(isExpanded: $advancedExpanded) {
-                            VStack(alignment: .leading, spacing: 16) {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Tuning")
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
-                                    HStack(spacing: 12) {
-                                        TextField("Pulse delay", text: $pulseDelay)
-                                            .keyboardType(.numberPad)
-                                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                                            .frame(width: 90)
-
-                                        Button("Save Delay") {
-                                            sendPulseDelayCommand()
-                                        }
-                                        .buttonStyle(.borderedProminent)
-                                        .disabled(isBusy)
-                                    }
-                                }
-
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Log")
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
-                                    HStack(spacing: 12) {
-                                        Button("View Log") {
-                                            sendViewLogCommand()
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .frame(maxWidth: .infinity)
-                                        .disabled(isBusy)
-
-                                        Button("Clear Log") {
-                                            sendClearLogCommand()
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .frame(maxWidth: .infinity)
-                                        .disabled(isBusy)
-                                    }
-                                }
-
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Device")
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
-                                    HStack {
-                                        Text("IP Address")
-                                        Spacer()
-                                        Text(deviceIP ?? deviceAddress ?? "Unknown")
-                                            .foregroundColor(.secondary)
-                                            .textSelection(.enabled)
-                                    }
-                                    Button("Reset Network") {
-                                        sendResetNetwork()
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .tint(.red)
-                                    .frame(maxWidth: .infinity)
-                                    .disabled(isBusy)
-                                }
-                            }
-                            .padding(.top, 6)
+                        Button {
+                            sendLockCommand()
                         } label: {
-                            Text("Advanced Settings")
-                                .font(.headline)
+                            HStack {
+                                Label("Color Lock", systemImage: "lock.fill")
+                                    // Extra dimming so disabled rows don't read as white on the dark background
+                                    .opacity(!lightOn || !isColorLockAvailable || isBusy ? 0.4 : 1)
+                                Spacer()
+                                if lightOn && !isColorLockAvailable {
+                                    Text("Colors 1–7 only")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .disabled(!lightOn || !isColorLockAvailable || isBusy)
+
+                        Button {
+                            sendReturnCommand()
+                        } label: {
+                            Label("Return to Locked Color", systemImage: "arrow.uturn.backward")
+                        }
+                        .disabled(!lightOn || isBusy)
+                        .opacity(!lightOn || isBusy ? 0.4 : 1)
+                    }
+                    .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
+
+                    Section {
+                        NavigationLink(value: "advanced") {
+                            Label("Advanced Settings", systemImage: "gearshape")
                         }
                     }
                     .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
                 }
-
-                Section(header: Text("Status")) {
-                    Text(statusMessage)
-                }
-                .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
             }
             // Deep pool-blue backdrop to match the app icon, with a light shining behind the
             // Light On switch while the light is on
             .scrollContentBackground(.hidden)
             .background(
                 ZStack {
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.03, green: 0.10, blue: 0.30),
-                            Color(red: 0.05, green: 0.25, blue: 0.55)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
+                    poolBackdrop
 
                     GeometryReader { geometry in
                         let origin = geometry.frame(in: .global).origin
@@ -703,9 +686,9 @@ struct ContentView: View {
                             ],
                             center: .center,
                             startRadius: 0,
-                            endRadius: 190
+                            endRadius: 70
                         )
-                        .frame(width: 380, height: 380)
+                        .frame(width: 140, height: 140)
                         .position(x: toggleFrame.maxX - 40 - origin.x, y: toggleFrame.midY - origin.y)
                         .opacity(lightOn && deviceAddress != nil ? 1 : 0)
                         .animation(.easeInOut(duration: 0.6), value: lightOn)
@@ -713,21 +696,6 @@ struct ContentView: View {
                 }
                 .ignoresSafeArea()
             )
-            // Progress floats over the screen so it doesn't push the layout down
-            .overlay {
-                if isBusy {
-                    VStack(spacing: 14) {
-                        OperationProgressRing(start: operationStart, duration: operationDuration)
-                            .frame(width: 56, height: 56)
-                        Text(operationName)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(28)
-                    .background(.ultraThinMaterial.opacity(0.85), in: RoundedRectangle(cornerRadius: 20))
-                    .transition(.opacity)
-                }
-            }
-            .animation(.easeInOut(duration: 0.2), value: isBusy)
             .preferredColorScheme(.dark)
             .navigationTitle("Pool Light Control")
             .toolbar {
@@ -747,8 +715,21 @@ struct ContentView: View {
                     .disabled(isDiscovering || isBusy)
                 }
             }
+            .navigationDestination(for: String.self) { page in
+                if page == "log" {
+                    logPage
+                } else {
+                    advancedSettings
+                }
+            }
             .sheet(isPresented: $showAbout) {
                 AboutView()
+            }
+            .onChange(of: deviceAddress) { _, address in
+                // The Advanced screen only applies to a connected device (e.g. after Reset Network)
+                if address == nil {
+                    navigationPath = NavigationPath()
+                }
             }
             .onAppear(perform: performInitialDiscovery)
             .onChange(of: scenePhase) { _, phase in
@@ -756,7 +737,206 @@ struct ContentView: View {
                 if phase == .active, let address = deviceAddress {
                     Task { await loadDeviceState(from: address) }
                 }
+                // Coming back from Settings after joining LIGHT_SETUP, so look for the device right away
+                if phase == .active, deviceAddress == nil, showConnectSetup, !isBusy {
+                    startDiscovery()
+                }
             }
+        }
+        // Progress and confirmations float over the screen so they don't push the layout down
+        .overlay {
+            if isBusy {
+                VStack(spacing: 14) {
+                    OperationProgressRing(start: operationStart, duration: operationDuration)
+                        .frame(width: 56, height: 56)
+                    Text(operationName)
+                        .foregroundColor(.secondary)
+                }
+                .padding(28)
+                .background(.ultraThinMaterial.opacity(0.85), in: RoundedRectangle(cornerRadius: 20))
+                .transition(.opacity)
+            } else if let confirmation {
+                VStack(spacing: 14) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(.green)
+                    Text(confirmation)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(28)
+                .frame(maxWidth: 280)
+                .background(.ultraThinMaterial.opacity(0.85), in: RoundedRectangle(cornerRadius: 20))
+                .transition(.opacity)
+                .allowsHitTesting(false)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: isBusy)
+        .animation(.easeInOut(duration: 0.2), value: confirmation)
+        .alert(errorTitle, isPresented: Binding(
+            get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(errorMessage ?? "")
+        }
+    }
+
+    private func troubleshootingRow(_ title: String, systemImage: String, _ detail: LocalizedStringKey) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(title, systemImage: systemImage)
+                .font(.headline)
+            Text(detail)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Deep pool-blue gradient to match the app icon.
+    private var poolBackdrop: some View {
+        LinearGradient(
+            colors: [
+                Color(red: 0.03, green: 0.10, blue: 0.30),
+                Color(red: 0.05, green: 0.25, blue: 0.55)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private var advancedSettings: some View {
+        Form {
+            Section {
+                HStack {
+                    Text("Pulse Delay")
+                    Spacer()
+                    TextField("50", text: $pulseDelay)
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .foregroundColor(.secondary)
+                        .frame(width: 80)
+                        .focused($pulseDelayFocused)
+                    Text("ms")
+                        .foregroundColor(.secondary)
+                }
+                .disabled(isBusy)
+            } header: {
+                Text("Relay")
+            } footer: {
+                Text("Relay on/off time per pulse.")
+            }
+            .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
+
+            Section(header: Text("Log")) {
+                NavigationLink(value: "log") {
+                    Label("View Log", systemImage: "doc.text")
+                }
+            }
+            .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
+
+            Section(header: Text("Network")) {
+                Button(role: .destructive) {
+                    showResetConfirmation = true
+                } label: {
+                    Label("Reset Network", systemImage: "wifi.exclamationmark")
+                }
+                .disabled(isBusy)
+                .alert("Reset Network?", isPresented: $showResetConfirmation) {
+                    Button("Reset", role: .destructive) {
+                        sendResetNetwork()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("The light controller will forget its Wi-Fi settings and reboot into setup mode. You'll need to set up Wi-Fi again.")
+                }
+            }
+            .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
+        }
+        .scrollContentBackground(.hidden)
+        .background(poolBackdrop.ignoresSafeArea())
+        .navigationTitle("Advanced Settings")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            // The number pad has no return key, so give it a Done button
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") {
+                    pulseDelayFocused = false
+                }
+            }
+        }
+        .onChange(of: pulseDelayFocused) { _, focused in
+            if focused {
+                pulseDelayBeforeEdit = pulseDelay
+            } else if pulseDelay != pulseDelayBeforeEdit {
+                sendPulseDelayCommand()
+            }
+        }
+    }
+
+    private var logPage: some View {
+        Form {
+            Section {
+                if let logEntries {
+                    ForEach(Array(logEntries.enumerated().reversed()), id: \.offset) { _, entry in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(entry.message)
+                            if !entry.time.isEmpty {
+                                Text(entry.time)
+                                    .font(.footnote.monospacedDigit())
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .textSelection(.enabled)
+                    }
+                } else if isLoadingLog {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Loading…")
+                            .foregroundColor(.secondary)
+                    }
+                } else {
+                    Text("Couldn't load the log.")
+                        .foregroundColor(.secondary)
+                }
+            } header: {
+                Text("Newest First")
+            } footer: {
+                Text("Times are since the light controller last started. Pull down to refresh.")
+            }
+            .listRowBackground(Color(red: 0.06, green: 0.10, blue: 0.20).opacity(0.55))
+        }
+        .scrollContentBackground(.hidden)
+        .background(poolBackdrop.ignoresSafeArea())
+        .navigationTitle("Log")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            // In the toolbar so it stays visible however long the log is
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(role: .destructive) {
+                    showClearLogConfirmation = true
+                } label: {
+                    Label("Clear Log", systemImage: "trash")
+                }
+                .tint(.red)
+                .disabled(isBusy || logEntries == nil)
+            }
+        }
+        .alert("Clear Log?", isPresented: $showClearLogConfirmation) {
+            Button("Clear", role: .destructive) {
+                sendClearLogCommand()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The light controller's log will be permanently erased.")
+        }
+        .refreshable {
+            await loadLog()
+        }
+        .task {
+            await loadLog()
         }
     }
 
@@ -768,8 +948,8 @@ struct ContentView: View {
     func sendCommand(
         _ path: String,
         method: String = "GET",
-        errorLabel: String,
-        success: String,
+        errorTitle: String,
+        success: String? = nil,
         rediscoverOnFailure: Bool = true,
         busy: (name: String, pulses: Int)? = nil,
         onSuccess: (() -> Void)? = nil
@@ -796,19 +976,18 @@ struct ContentView: View {
                     timeout: timeout
                 )
                 if (200..<300).contains(result.status) {
-                    statusMessage = success
                     succeeded = true
                 } else {
-                    statusMessage = "\(errorLabel) error: HTTP \(result.status)"
+                    showError(errorTitle, "The light controller replied with error \(result.status).")
                 }
             } catch {
                 // A slow reply (timeout) or dropped connection doesn't mean the device moved, so
                 // only search again when the device can't be reached at all.
                 if rediscoverOnFailure && isUnreachable(error) {
-                    statusMessage = "\(errorLabel) error: \(error.localizedDescription). Looking for the device again..."
+                    showError(errorTitle, "\(error.localizedDescription) Looking for the light controller again.")
                     startDiscovery()
                 } else {
-                    statusMessage = "\(errorLabel) error: \(error.localizedDescription)"
+                    showError(errorTitle, error.localizedDescription)
                 }
             }
 
@@ -820,7 +999,24 @@ struct ContentView: View {
                 }
                 isBusy = false
             }
-            if succeeded { onSuccess?() }
+            if succeeded {
+                if let success { confirm(success) }
+                onSuccess?()
+            }
+        }
+    }
+
+    func showError(_ title: String, _ message: String) {
+        errorTitle = title
+        errorMessage = message
+    }
+
+    /// Shows a checkmark with `message` for a moment.
+    func confirm(_ message: String) {
+        confirmation = message
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            if confirmation == message { confirmation = nil }
         }
     }
 
@@ -840,20 +1036,22 @@ struct ContentView: View {
         do {
             let result = try await PoolLightNetwork.request(host: setupAddress, path: "/scan", timeout: 20)
             guard (200..<300).contains(result.status) else {
-                statusMessage = "Network scan not available (HTTP \(result.status)). Enter the network manually."
+                selectedNetwork = Self.manualNetworkTag
+                setupNote = "Couldn't scan for networks. Enter your network name manually."
                 return
             }
             let networks = PoolLightNetwork.parseNetworkList(result.body)
             availableNetworks = networks
             if networks.isEmpty {
                 selectedNetwork = Self.manualNetworkTag
-                statusMessage = "No networks found. Enter the network manually."
+                setupNote = "No networks found. Enter your network name manually."
             } else {
                 if !networks.contains(where: { $0.ssid == selectedNetwork }) { selectedNetwork = networks[0].ssid }
-                statusMessage = "Found \(networks.count) network\(networks.count == 1 ? "" : "s")."
+                setupNote = Self.defaultSetupNote
             }
         } catch {
-            statusMessage = "Network scan failed: \(error.localizedDescription). Enter the network manually."
+            selectedNetwork = Self.manualNetworkTag
+            setupNote = "Couldn't scan for networks. Enter your network name manually."
         }
     }
 
@@ -896,29 +1094,36 @@ struct ContentView: View {
                     timeout: 10
                 )
             } catch {
-                statusMessage = "Setup error: \(error.localizedDescription)"
+                showError("Couldn't Connect", error.localizedDescription)
                 return
             }
-            statusMessage = "Setup sent. Device should reboot. Waiting for device..."
-            // Clear previously-known address and begin discovery once the device has rebooted
+            statusMessage = "Wi-Fi settings sent. Waiting for the light controller to restart…"
+            // Clear previously-known address and begin discovery once the device has rebooted.
+            // Leaving setup first makes discovery search the home network, not LIGHT_SETUP.
             deviceAddress = nil
             lastDeviceAddress = ""
-            try? await Task.sleep(for: .seconds(6))
+            showSetupForm = false
+
+            // Give the device time to restart and join the home network before searching for it
+            let joinWait: TimeInterval = 20
+            operationName = "Joining Wi-Fi…"
+            operationDuration = joinWait
+            operationStart = Date()
+            isBusy = true
+            try? await Task.sleep(for: .seconds(joinWait))
+            isBusy = false
             await runDiscovery()
         }
     }
 
     func sendColorCommand() {
-        guard lightOn else {
-            statusMessage = "Cannot set color while light is off."
-            return
-        }
+        guard lightOn else { return }
         let encodedColor = selectedColor.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? selectedColor
         // The light steps through one pulse per color number before the device replies
         sendCommand(
             "/color/" + encodedColor,
-            errorLabel: "Color",
-            success: "Color command \(selectedColor) sent.",
+            errorTitle: "Couldn't Change Color",
+            success: "Color set to \(colorName(selectedColor))",
             busy: (name: "Changing color…", pulses: Int(selectedColor) ?? 12)
         )
     }
@@ -926,9 +1131,12 @@ struct ContentView: View {
     func sendPowerCommand(on: Bool) {
         sendCommand(
             "/power/" + (on ? "on" : "off"),
-            errorLabel: "Power",
-            success: "Power \(on ? "ON" : "OFF") command sent."
+            errorTitle: "Couldn't Turn Light \(on ? "On" : "Off")"
         )
+    }
+
+    func colorName(_ id: String) -> String {
+        colorOptions.first { $0.0 == id }?.1 ?? "color \(id)"
     }
 
     var isColorLockAvailable: Bool {
@@ -939,29 +1147,23 @@ struct ContentView: View {
     }
 
     func sendLockCommand() {
-        guard isColorLockAvailable else {
-            statusMessage = "Color Lock requires a color between 1 and 7."
-            return
-        }
+        guard isColorLockAvailable else { return }
         // Color lock takes 13 pulses
         sendCommand(
             "/lock",
-            errorLabel: "Color lock",
-            success: "Color lock sent.",
+            errorTitle: "Couldn't Lock Color",
+            success: "Color locked",
             busy: (name: "Locking color…", pulses: 13)
         )
     }
 
     func sendReturnCommand() {
-        guard lightOn else {
-            statusMessage = "Cannot send return command while light is off."
-            return
-        }
+        guard lightOn else { return }
         // Return takes 14 pulses
         sendCommand(
             "/return",
-            errorLabel: "Return",
-            success: "Return command sent.",
+            errorTitle: "Couldn't Return to Locked Color",
+            success: "Returned to locked color",
             busy: (name: "Returning…", pulses: 14)
         )
     }
@@ -969,42 +1171,62 @@ struct ContentView: View {
     func sendPulseDelayCommand() {
         let delayValue = pulseDelay.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let encodedValue = delayValue.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed), !encodedValue.isEmpty else {
-            statusMessage = "Enter a valid pulse delay."
+            showError("Invalid Pulse Delay", "Enter the delay in milliseconds.")
             return
         }
         sendCommand(
             "/pulse-delay/" + encodedValue,
-            errorLabel: "Pulse delay",
-            success: "Pulse delay set to \(delayValue) ms."
+            errorTitle: "Couldn't Save Pulse Delay",
+            success: "Pulse delay set to \(delayValue) ms"
         )
     }
 
-    func sendViewLogCommand() {
-        guard !isBusy else { return }
-        guard let url = URL(string: "http://" + currentDeviceAddress() + "/log") else {
-            statusMessage = "Invalid URL"
-            return
+    /// Reads the device's log, which is plain text with one entry per line, e.g. `12345ms connected`.
+    func loadLog() async {
+        isLoadingLog = true
+        defer { isLoadingLog = false }
+        do {
+            let result = try await PoolLightNetwork.request(host: currentDeviceAddress(), path: "/log", timeout: 5)
+            guard (200..<300).contains(result.status) else {
+                showError("Couldn't Load Log", "The light controller replied with error \(result.status).")
+                return
+            }
+            logEntries = result.body
+                .split(whereSeparator: \.isNewline)
+                .map { line in
+                    if let match = line.wholeMatch(of: /(\d+)ms (.*)/), let ms = Int(match.1) {
+                        return (time: formatUptime(ms), message: String(match.2))
+                    }
+                    return (time: "", message: String(line))
+                }
+        } catch {
+            showError("Couldn't Load Log", error.localizedDescription)
         }
-        // The log is a web page served by the device, so open it in the browser
-        openURL(url)
-        statusMessage = "Log opened in browser."
+    }
+
+    /// Formats milliseconds since boot as h:mm:ss.
+    func formatUptime(_ ms: Int) -> String {
+        let seconds = ms / 1000
+        return String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
     }
 
     func sendClearLogCommand() {
-        statusMessage = "Clearing Wi-Fi log..."
-        sendCommand("/clear-log", errorLabel: "Failed to clear Wi-Fi log", success: "Wi-Fi log cleared.")
+        sendCommand("/clear-log", errorTitle: "Couldn't Clear Log", success: "Log cleared") {
+            Task { await loadLog() }
+        }
     }
 
     func sendResetNetwork() {
         sendCommand(
             "/reset",
             method: "POST",
-            errorLabel: "Reset",
-            success: "Reset command sent. Device will reboot.",
+            errorTitle: "Couldn't Reset Network",
+            success: "Network reset. The light controller is restarting.",
             rediscoverOnFailure: false
         ) {
             deviceAddress = nil
             lastDeviceAddress = ""
+            statusMessage = "The light controller is restarting in setup mode."
         }
     }
 
@@ -1032,15 +1254,26 @@ struct ContentView: View {
         isDiscovering = true
         defer { isDiscovering = false }
 
+        // If the app was already showing setup, the user most likely just joined LIGHT_SETUP,
+        // where the device is at a fixed address, so check there before searching the network
+        let expectingSetup = showConnectSetup || showSetupForm
+
         showSetupForm = false
         showConnectSetup = false
-        showResetInstruction = false
         scanProgress = 0
         discoveryStage = .domain
 
+        if expectingSetup {
+            statusMessage = "Checking for LIGHT_SETUP…"
+            if await isLightSetupAvailable() {
+                showSetup()
+                return
+            }
+        }
+
         // 1. Last known address
         if !lastDeviceAddress.isEmpty {
-            statusMessage = "Checking last known address..."
+            statusMessage = "Checking the last known address…"
             if await PoolLightNetwork.isPoolLight(lastDeviceAddress, timeout: 1.5) {
                 found(lastDeviceAddress, via: "saved address")
                 return
@@ -1048,14 +1281,14 @@ struct ContentView: View {
         }
 
         // 2. Bonjour
-        statusMessage = "Searching with Bonjour..."
+        statusMessage = "Searching with Bonjour…"
         if let address = await discoverByBonjour() {
             found(address, via: "Bonjour")
             return
         }
 
         // 3. Hostnames
-        statusMessage = "Looking up poollight.local..."
+        statusMessage = "Looking up poollight.local…"
         if let host = await PoolLightNetwork.firstPoolLight(
             in: [deviceLocalHost, deviceHost],
             timeout: 2.0,
@@ -1073,25 +1306,30 @@ struct ContentView: View {
 
         // 5. Setup access point
         discoveryStage = .setup
-        statusMessage = "Device not found by address scan. Checking Wi-Fi connection..."
+        statusMessage = "Not found on this network. Checking for LIGHT_SETUP…"
 
         if await isLightSetupAvailable() {
-            showSetupForm = true
-            statusMessage = "Connected to LIGHT_SETUP. Choose your router and enter its password."
-            Task { await scanWiFiNetworks() }
+            showSetup()
             return
         }
 
         showConnectSetup = true
-        showResetInstruction = true
-        statusMessage = "Not connected to LIGHT_SETUP. If LIGHT_SETUP is available, connect to it. Otherwise reset the ESP32 by holding the button for 10 seconds."
+        statusMessage = "Couldn't find the light controller on this network."
+    }
+
+    func showSetup() {
+        discoveryStage = .setup
+        showSetupForm = true
+        statusMessage = "Connected to the light controller's LIGHT_SETUP network."
+        setupNote = Self.defaultSetupNote
+        Task { await scanWiFiNetworks() }
     }
 
     func found(_ address: String, via method: String) {
         deviceAddress = address
         lastDeviceAddress = address
         discoveryStage = .complete
-        statusMessage = "Device found at \(address) via \(method)"
+        statusMessage = "Found via \(method)"
         Task { await loadDeviceState(from: address) }
         Task { deviceIP = await PoolLightNetwork.resolveIPv4Address(of: address) }
     }
@@ -1139,7 +1377,7 @@ struct ContentView: View {
 
     func discoverByScanningNetwork() async -> String? {
         discoveryStage = .network
-        statusMessage = "Scanning local network for the ESP32..."
+        statusMessage = "Scanning the local network…"
         scanProgress = 0
 
         let prefixes: [String]
